@@ -1,197 +1,308 @@
 import streamlit as st
 import cv2
 import mediapipe as mp
-import numpy as np
-import pandas as pd
 import math
 import time
-from collections import deque
-import os
-from PIL import Image
+import platform
+import threading
+import traceback
 
-# ----------------- Streamlit Config -----------------
+# ============================================
+# STREAMLIT SETUP
+# ============================================
 st.set_page_config(page_title="Gesture Volume", layout="wide")
 
-# ----------------- Custom CSS -----------------
 st.markdown("""
-    <style>
-        .stApp {
-            background: linear-gradient(to bottom right, #111827, #1f2937);
-            color: #ffffff;
-            font-family: 'Segoe UI', sans-serif;
-        }
-        h1, h2, h3 { color: #10b981 !important; text-align:center; }
-        .metric-card {
-            background: #1e293b;
-            border-radius: 15px;
-            padding: 1.2rem;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.4);
-            margin-bottom: 1rem;
-            text-align:center;
-        }
-        .metric-value {
-            font-size: 1.4rem;
-            font-weight: bold;
-            color: #facc15;
-        }
-        .stSidebar { background-color: #0f172a !important; }
-    </style>
+<style>
+    .stApp {
+        background: linear-gradient(to bottom right, #111827, #1f2937);
+        color: #ffffff;
+        font-family: 'Segoe UI', sans-serif;
+    }
+    h1, h2 { 
+        color: #10b981 !important; 
+        text-align:center; 
+    }
+    .stSidebar { background-color: #0f172a !important; }
+</style>
 """, unsafe_allow_html=True)
 
-# ----------------- Sidebar -----------------
+# ============================================
+# SIDEBAR
+# ============================================
 with st.sidebar:
     st.markdown("### GestureVolume")
-    run = st.toggle("▶️ Run Detection", value=False)
-    camera_index = st.number_input("📷 Camera Index", min_value=0, max_value=4, value=0)
-    min_det_conf = st.slider("Detection Confidence", 0.1, 1.0, 0.5, 0.05)
-    min_track_conf = st.slider("Tracking Confidence", 0.1, 1.0, 0.5, 0.05)
-    log_csv = st.checkbox("Log Measurements to CSV", value=False)
-    csv_path = st.text_input("CSV filename", value="hand_measurements.csv")
+    run = st.toggle("▶️ Run Detection", False)
+    camera_index = st.number_input("📷 Camera Index", 0, 4, 0)
+    min_det_conf = st.slider("Detection Confidence", 0.1, 1.0, 0.6)
+    min_track_conf = st.slider("Tracking Confidence", 0.1, 1.0, 0.6)
     st.markdown("---")
-    st.caption("💡 If camera doesn’t start, increase camera index or close other apps using the webcam.")
+    st.caption("💡 If camera doesn’t start, switch camera index or close other apps.")
 
-# ----------------- Header -----------------
-st.markdown("<h1>Gesture Volume & Landmark Analyzer ✨</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;'>View live hand landmarks, distances, and aspect ratio in a unified dashboard.</p>", unsafe_allow_html=True)
+# ============================================
+# HEADER
+# ============================================
+st.markdown("<h1>Gesture Volume Control</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;'>Pinch gesture controls your Windows system volume.</p>", unsafe_allow_html=True)
 
-# ----------------- MediaPipe Init -----------------
+# ============================================
+# GLOBALS
+# ============================================
+hotkeys_started = False
+hotkey_stop = threading.Event()
+hotkey_error = None
+
+volume_thread_started = False
+volume_stop = threading.Event()
+requested_volume = None
+volume_lock = threading.Lock()
+
+sys_set_volume = None
+
+latest_frame = None
+frame_lock = threading.Lock()
+camera_running = False
+camera_thread_obj = None
+
+# ============================================
+# HOTKEYS (WINDOWS ONLY)
+# ============================================
+if platform.system() == "Windows":
+    try:
+        import keyboard
+        from ctypes import POINTER, cast
+        from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, GUID
+        from comtypes.client import CreateObject
+        from functools import wraps
+        from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
+
+        STEP_PERCENT = 5.0
+        eRender = 0
+        eCapture = 1
+        eConsole = 0
+
+        def ensure_com(func):
+            @wraps(func)
+            def wrapper(*a, **k):
+                CoInitialize()
+                try:
+                    return func(*a, **k)
+                finally:
+                    try: CoUninitialize()
+                    except: pass
+            return wrapper
+
+        def _create_enum():
+            try:
+                return CreateObject("MMDeviceEnumerator.MMDeviceEnumerator", interface=IMMDeviceEnumerator)
+            except Exception:
+                clsid = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+                return CreateObject(clsid, interface=IMMDeviceEnumerator)
+
+        def _get_mic_volume():
+            enum = _create_enum()
+            dev = enum.GetDefaultAudioEndpoint(eCapture, eConsole)
+            iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            return cast(iface, POINTER(IAudioEndpointVolume))
+
+        def _get_system_volume():
+            enum = _create_enum()
+            dev = enum.GetDefaultAudioEndpoint(eRender, eConsole)
+            iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            return cast(iface, POINTER(IAudioEndpointVolume))
+
+        def _pct_to_scalar(p): return max(0.0, min(1.0, p / 100.0))
+        def _scalar_to_pct(s): return max(0.0, min(100.0, s * 100.0))
+
+        @ensure_com
+        def sys_up():
+            v = _get_system_volume()
+            cur = v.GetMasterVolumeLevelScalar()
+            v.SetMasterVolumeLevelScalar(min(1.0, cur + STEP_PERCENT / 100.0), None)
+
+        @ensure_com
+        def sys_down():
+            v = _get_system_volume()
+            cur = v.GetMasterVolumeLevelScalar()
+            v.SetMasterVolumeLevelScalar(max(0.0, cur - STEP_PERCENT / 100.0), None)
+
+        @ensure_com
+        def sys_toggle_mute():
+            v = _get_system_volume()
+            v.SetMute(1 if not bool(v.GetMute()) else 0, None)
+
+        @ensure_com
+        def _sys_set_volume(percent):
+            v = _get_system_volume()
+            scalar = max(0.0, min(1.0, percent / 100.0))
+            v.SetMasterVolumeLevelScalar(scalar, None)
+
+        sys_set_volume = _sys_set_volume
+
+        def hotkey_runner():
+            try: keyboard.unhook_all()
+            except: pass
+
+            keyboard.add_hotkey("ctrl+alt+right", sys_up)
+            keyboard.add_hotkey("ctrl+alt+left", sys_down)
+            keyboard.add_hotkey("ctrl+alt+shift+m", sys_toggle_mute)
+            keyboard.add_hotkey("ctrl+alt+q", lambda: hotkey_stop.set())
+
+            while not hotkey_stop.is_set():
+                time.sleep(0.1)
+
+        def start_hotkeys():
+            global hotkeys_started
+            if not hotkeys_started:
+                threading.Thread(target=hotkey_runner, daemon=True).start()
+                hotkeys_started = True
+
+    except Exception as e:
+        hotkey_error = str(e) + "\n" + traceback.format_exc()
+
+if platform.system() == "Windows":
+    if hotkey_error:
+        st.error("Hotkeys failed:\n" + hotkey_error)
+    else:
+        if not hotkeys_started:
+            start_hotkeys()
+            st.success("🎧 Hotkeys active (Ctrl + Alt + Q to stop)")
+else:
+    st.warning("Hotkeys work only on Windows.")
+
+# ============================================
+# BACKGROUND VOLUME WORKER
+# ============================================
+def volume_worker(poll_interval=0.15):
+    last_sent = None
+    while not volume_stop.is_set():
+        time.sleep(poll_interval)
+        with volume_lock:
+            vol = requested_volume
+        if vol is None or vol == last_sent:
+            continue
+        last_sent = vol
+        try:
+            if platform.system() == "Windows" and sys_set_volume:
+                sys_set_volume(vol)
+        except:
+            pass
+
+if not volume_thread_started:
+    threading.Thread(target=volume_worker, daemon=True).start()
+    volume_thread_started = True
+
+# ============================================
+# GESTURE → VOLUME MAP
+# ============================================
+def map_distance_to_volume(dist, min_d=20, max_d=200):
+    dist_clamped = max(min_d, min(max_d, dist))
+    return int((dist_clamped - min_d) * 100 / (max_d - min_d))
+
+# ============================================
+# CAMERA BACKGROUND THREAD
+# ============================================
 mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(static_image_mode=False,
-                       model_complexity=1,
-                       min_detection_confidence=float(min_det_conf),
-                       min_tracking_confidence=float(min_track_conf),
-                       max_num_hands=1)
+mp_draw = mp.solutions.drawing_utils
 
-LANDMARK_NAMES = {
-    0: "WRIST", 1: "THUMB_CMC", 2: "THUMB_MCP", 3: "THUMB_IP", 4: "THUMB_TIP",
-    5: "INDEX_MCP", 6: "INDEX_PIP", 7: "INDEX_DIP", 8: "INDEX_TIP",
-    9: "MIDDLE_MCP", 10: "MIDDLE_PIP", 11: "MIDDLE_DIP", 12: "MIDDLE_TIP",
-    13: "RING_MCP", 14: "RING_PIP", 15: "RING_DIP", 16: "RING_TIP",
-    17: "PINKY_MCP", 18: "PINKY_PIP", 19: "PINKY_DIP", 20: "PINKY_TIP"
-}
+def camera_capture_thread(cam_index, det_conf, track_conf):
+    global latest_frame, camera_running
 
-def calc_dist(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    cap = cv2.VideoCapture(int(cam_index))
+    if not cap.isOpened():
+        camera_running = False
+        return
 
-# ----------------- Data buffers -----------------
-aspect_ratio_data = deque(maxlen=100)
-time_data = deque(maxlen=100)
-start_time = time.time()
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        model_complexity=1,
+        min_detection_confidence=det_conf,
+        min_tracking_confidence=track_conf,
+        max_num_hands=1
+    )
 
-if log_csv:
-    first_write = not os.path.exists(csv_path)
-    csv_file = open(csv_path, "a", newline="")
-    import csv
-    csv_writer = csv.writer(csv_file)
-    if first_write:
-        csv_writer.writerow(["iso_ts", "elapsed_s",
-                             "pinky_ring_px", "ring_middle_px", "middle_index_px", "index_thumb_px",
-                             "height_px", "width_px", "aspect_ratio"])
-
-# ----------------- Main Detection -----------------
-if run:
-    cap = cv2.VideoCapture(int(camera_index))
-    frame_display = st.empty()
-    metrics_container = st.container()
-    st.markdown("---")
-    st.markdown("### 📊 Landmark Table")
-    table_display = st.empty()
-    st.markdown("### 📈 Aspect Ratio Chart")
-    chart_area = st.empty()
-
-    while run:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("⚠️ Unable to access camera.")
-            break
+    while camera_running:
+        ok, frame = cap.read()
+        if not ok:
+            continue
 
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
         if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            lm = results.multi_hand_landmarks[0]
+            mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
 
-            df_rows, coords = [], []
-            for idx, lm in enumerate(hand_landmarks.landmark):
-                x_px, y_px = int(lm.x * w), int(lm.y * h)
-                coords.append((x_px, y_px))
-                df_rows.append({
-                    "Index": idx,
-                    "Landmark": LANDMARK_NAMES.get(idx, f"LM_{idx}"),
-                    "X (px)": x_px,
-                    "Y (px)": y_px
-                })
-            df = pd.DataFrame(df_rows).set_index("Index")
+            x4, y4 = int(lm.landmark[4].x * w), int(lm.landmark[4].y * h)
+            x8, y8 = int(lm.landmark[8].x * w), int(lm.landmark[8].y * h)
 
-            # Compute distances
-            dist_pinky_ring = calc_dist(coords[20], coords[16])
-            dist_ring_middle = calc_dist(coords[16], coords[12])
-            dist_middle_index = calc_dist(coords[12], coords[8])
-            dist_index_thumb = calc_dist(coords[8], coords[4])
-            height_px = calc_dist(coords[0], coords[12])
-            width_px = calc_dist(coords[2], coords[17])
-            aspect_ratio = height_px / width_px if width_px != 0 else 0.0
+            dist = int(math.hypot(x8 - x4, y8 - y4))
+            cv2.line(frame, (x4, y4), (x8, y8), (0, 255, 255), 3)
 
-            # Draw measurement lines
-            cv2.line(frame, coords[20], coords[16], (0,255,255), 2)
-            cv2.line(frame, coords[16], coords[12], (0,255,255), 2)
-            cv2.line(frame, coords[12], coords[8], (0,255,255), 2)
-            cv2.line(frame, coords[8], coords[4], (0,255,255), 2)
-            cv2.line(frame, coords[0], coords[12], (255,0,0), 2)
-            cv2.line(frame, coords[2], coords[17], (255,0,255), 2)
+            cx, cy = (x4 + x8) // 2, (y4 + y8) // 2
+            cv2.putText(frame, f"{dist}px", (cx, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-            # Append chart data
-            t = time.time() - start_time
-            time_data.append(t)
-            aspect_ratio_data.append(aspect_ratio)
+            volume_pct = map_distance_to_volume(dist)
+            with volume_lock:
+                global requested_volume
+                requested_volume = volume_pct
 
-            # Show frame
-            frame_display.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+            cv2.putText(frame, f"Vol: {volume_pct}%", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
 
-            # Measurements cards
-            with metrics_container:
-                st.markdown("### 📏 Live Measurements")
-                col1, col2, col3 = st.columns(3)
-                col1.markdown(f"<div class='metric-card'><div>Pinky–Ring</div><div class='metric-value'>{dist_pinky_ring:.1f}px</div></div>", unsafe_allow_html=True)
-                col2.markdown(f"<div class='metric-card'><div>Ring–Middle</div><div class='metric-value'>{dist_ring_middle:.1f}px</div></div>", unsafe_allow_html=True)
-                col3.markdown(f"<div class='metric-card'><div>Middle–Index</div><div class='metric-value'>{dist_middle_index:.1f}px</div></div>", unsafe_allow_html=True)
-                col1.markdown(f"<div class='metric-card'><div>Index–Thumb</div><div class='metric-value'>{dist_index_thumb:.1f}px</div></div>", unsafe_allow_html=True)
-                col2.markdown(f"<div class='metric-card'><div>Height (Wrist→MiddleTip)</div><div class='metric-value'>{height_px:.1f}px</div></div>", unsafe_allow_html=True)
-                col3.markdown(f"<div class='metric-card'><div>Width (ThumbMCP→PinkyMCP)</div><div class='metric-value'>{width_px:.1f}px</div></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='metric-card'><div>Aspect Ratio</div><div class='metric-value'>{aspect_ratio:.3f}</div></div>", unsafe_allow_html=True)
-
-            # Table
-            table_display.dataframe(df, use_container_width=True)
-
-            # Chart
-            chart_df = pd.DataFrame({"Time (s)": list(time_data), "Aspect Ratio": list(aspect_ratio_data)})
-            chart_area.line_chart(chart_df.set_index("Time (s)"), height=300, use_container_width=True)
-
-            # CSV logging
-            if log_csv:
-                iso_ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-                elapsed = time.time() - start_time
-                csv_writer.writerow([iso_ts, f"{elapsed:.3f}",
-                                    dist_pinky_ring, dist_ring_middle, dist_middle_index,
-                                    dist_index_thumb, height_px, width_px, aspect_ratio])
-                if int(elapsed) % 5 == 0:
-                    csv_file.flush()
-
-        time.sleep(0.03)
+        with frame_lock:
+            latest_frame = frame.copy()
 
     cap.release()
-    if log_csv:
-        csv_file.close()
+    hands.close()
 
+# ============================================
+# STREAMLIT CAMERA CONTROLLER
+# ============================================
+if run and not camera_running:
+    camera_running = True
+    camera_thread_obj = threading.Thread(
+        target=camera_capture_thread,
+        args=(camera_index, min_det_conf, min_track_conf),
+        daemon=True
+    )
+    camera_thread_obj.start()
+
+if not run and camera_running:
+    camera_running = False
+
+# ============================================
+# DISPLAY FRAME
+# ============================================
+frame_box = st.empty()
+
+if camera_running:
+    with frame_lock:
+        if latest_frame is not None:
+            frame_box.image(cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB),
+                            channels="RGB", width=600)
 else:
-    st.markdown("""
-    <div style='text-align:center; margin-top:60px;'>
-        <img src='https://cdn-icons-png.flaticon.com/512/1995/1995626.png' width='120'/>
-        <h2>👋 Welcome to Gesture Volume Control</h2>
-        <p>Enable <b>“Run Detection”</b> in the sidebar to start live hand tracking.</p>
-        <p>Analyze landmarks, distances, and aspect ratio — all in one view!</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.info("Camera stopped.")
+
+# ============================================
+# STATUS PANEL
+# ============================================
+with st.expander("Status & Controls"):
+    with volume_lock:
+        st.write("Requested volume:", requested_volume)
+
+    if platform.system() == "Windows":
+        if st.button("Stop Hotkeys"):
+            hotkey_stop.set()
+            st.info("Hotkeys stopping...")
+
+
+
+
+def set_volume(percent):
+    """Set Windows master volume (0–100%)"""
+    percent = max(0, min(100, percent))  # clamp
+    scalar = percent / 100
+    volume_interface.SetMasterVolumeLevelScalar(scalar, None)
